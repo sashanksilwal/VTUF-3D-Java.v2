@@ -44,11 +44,10 @@
 
 package VTUF3D;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-
 import VTUF3D.Utilities.MaespaDataFile;
 import VTUF3D.Utilities.Namelist;
+import java.util.ArrayList;
+import java.util.HashMap;
 
 public class TUFreg3D
 {
@@ -225,6 +224,8 @@ public class TUFreg3D
         	System.exit(1);
         }
 		OverallConfiguration overall = new OverallConfiguration(rootDirectory);
+		// print the root directory
+		System.out.println("Root directory: " + rootDirectory);
 		treeMapFromConfig = overall.readMaespaTreeMapFromConfig(rootDirectory);
 		treeMapFromConfig.rootDirectory = rootDirectory;
 		DIFFERENTIALSHADINGDIFFUSE = treeMapFromConfig.usingDiffShading;

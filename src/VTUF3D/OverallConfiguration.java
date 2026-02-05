@@ -660,10 +660,27 @@ public class OverallConfiguration
 	    state.configTreeMapNumsfcab=configTreeMapNumsfcab;
 	    configTreeMapHighestBuildingHeight = treemapNamelist.getIntValue("domain", "configTreeMapHighestBuildingHeight");
 	    state.configTreeMapHighestBuildingHeight=configTreeMapHighestBuildingHeight;
- 
+
 	    state.configPartitioningMethod=treemapNamelist.getIntValue("runSwitches", "partitioningMethod");
 	    state.usingDiffShading=treemapNamelist.getIntValue("runSwitches", "usingDiffShading");
-	    
+
+	    // Read per-cell surface properties (optional section)
+	    try
+	    {
+	    	double[] cellAlbedo = treemapNamelist.getDoubleArrayValue("cellProperties", "cellAlbedo");
+	    	double[] cellEmissivity = treemapNamelist.getDoubleArrayValue("cellProperties", "cellEmissivity");
+	    	state.cellAlbedo = cellAlbedo;
+	    	state.cellEmissivity = cellEmissivity;
+	    	state.hasCellProperties = true;
+	    	System.out.println("Per-cell surface properties loaded: " + cellAlbedo.length + " cells");
+	    }
+	    catch(Exception e)
+	    {
+	    	// Per-cell properties not specified - use defaults
+	    	state.hasCellProperties = false;
+	    	System.out.println("No per-cell surface properties found, using uniform values from parameters.dat");
+	    }
+
 //	    end subroutine readMaespaTreeMapFromConfig
 	    return state;
 	 }

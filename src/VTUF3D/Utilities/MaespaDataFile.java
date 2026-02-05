@@ -152,6 +152,12 @@ public class MaespaDataFile
 	public double[] getDataArrayForVariable(String variable)
 	{
 		ArrayList<Double> variableItem = fileData.get(variable);
+
+		if (variableItem == null) {
+			System.err.println("Missing MAESPA variable: " + variable);
+			System.err.println("Available variables: " + fileData.keySet());
+			throw new RuntimeException("MAESPA variable not found");
+		}
 		
 		double[] returnData = new double[variableItem.size()]; ;
 		for (int i=0;i<variableItem.size();i++)

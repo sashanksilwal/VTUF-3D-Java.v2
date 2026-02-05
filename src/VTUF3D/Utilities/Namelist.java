@@ -176,7 +176,7 @@ public class Namelist
 		TreeMap<String,String> aGroup = namelistData.get(group);
 		String item = aGroup.get(key);
 		String[] splitItem = item.split(" ");
-		
+
 		int[] intValue =new int[splitItem.length];
 		int count = 0;
 		for (String aValue : splitItem)
@@ -184,8 +184,25 @@ public class Namelist
 			intValue[count]= new Integer(aValue).intValue();
 			count ++;
 		}
-		
+
 		return intValue;
+	}
+
+	public double[] getDoubleArrayValue(String group, String key)
+	{
+		TreeMap<String,String> aGroup = namelistData.get(group);
+		String item = aGroup.get(key);
+		String[] splitItem = item.split(" ");
+
+		double[] doubleValue = new double[splitItem.length];
+		int count = 0;
+		for (String aValue : splitItem)
+		{
+			doubleValue[count] = new Double(aValue).doubleValue();
+			count++;
+		}
+
+		return doubleValue;
 	}
 	
 //	public String getValue(String key)
