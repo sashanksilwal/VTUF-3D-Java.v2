@@ -160,9 +160,9 @@ public class VTUF3DUtil
       yinc=vyy-vy;
       zinc=vzz-vz;
       mag=Math.sqrt(Math.pow(xinc,2)+Math.pow(yinc,2)+Math.pow(zinc,2));
-      xinc=xinc/mag*0.25;
-      yinc=yinc/mag*0.25;
-      zinc=zinc/mag*0.25;
+      xinc=xinc/mag*Constants.RAY_INCREMENT_SCALE;
+      yinc=yinc/mag*Constants.RAY_INCREMENT_SCALE;
+      zinc=zinc/mag*Constants.RAY_INCREMENT_SCALE;
       inc=Math.sqrt(Math.pow(xinc,2)+Math.pow(yinc,2)+Math.pow(zinc,2));
 
       xt=vx+xinc;

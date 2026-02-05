@@ -173,7 +173,45 @@ public class Constants
    public static final int DIFFERENTIALSHADING100PERCENT=2;
    public static final int NUMOFDIFFERENTIALSHADINGS=2;
    public static final boolean DEBUG_MODE=false;
-   
 
-	
+   // ====== RAY TRACING CONSTANTS ======
+   // Increment used for stepping along rays during shade calculation
+   public static final double RAY_TRACE_INCREMENT = 0.2;
+   // Subdivision factor for face ray tracing (each patch divided into 4 sub-patches)
+   public static final double RAY_TRACE_FACE_SUBDIVISION = 0.25;
+   // Minimum distance before ray can hit obstacle (prevents self-shading)
+   // Slightly longer than center-to-corner distance (1.225)
+   public static final double SELF_SHADING_MIN_DISTANCE = 1.225;
+   // Ray increment scaling for view factor calculations
+   public static final double RAY_INCREMENT_SCALE = 0.25;
+
+   // ====== NEWTON'S METHOD CONSTANTS ======
+   // Convergence tolerance for temperature solver
+   public static final double NEWTON_CONVERGENCE_TOLERANCE = 0.001;
+   // Maximum iterations before adjusting httc
+   public static final int NEWTON_MAX_ITERATIONS = 40;
+   // Maximum httc adjustment retries
+   public static final int NEWTON_MAX_HTTC_RETRIES = 10;
+   // Amount to adjust httc when convergence fails
+   public static final double NEWTON_HTTC_ADJUSTMENT = 0.5;
+
+   // ====== BISECTION METHOD CONSTANTS ======
+   // Tolerance for bisection convergence
+   public static final double BISECTION_TOLERANCE = 0.001;
+
+   // ====== REFLECTION LOOP LIMITS ======
+   // Maximum number of reflection iterations (longwave/shortwave)
+   public static final int MAX_REFLECTION_ITERATIONS = 10;
+
+   // ====== TEMPERATURE CALCULATION CONSTANTS ======
+   // Quarter offset for subdividing patches
+   public static final double FACE_QUARTER_OFFSET = 0.25;
+   // Half offset for face positioning
+   public static final double FACE_HALF_OFFSET = 0.5;
+
+   // ====== PARALLEL PROCESSING DEFAULTS ======
+   // Minimum patches before parallelization is worthwhile
+   public static final int PARALLEL_MIN_PATCHES = 100;
+
+
 }

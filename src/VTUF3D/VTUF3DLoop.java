@@ -2,6 +2,9 @@ package VTUF3D;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.DoubleAdder;
+import java.util.stream.IntStream;
 
 import VTUF3D.Utilities.Common;
 import VTUF3D.Utilities.MaespaDataFile;
@@ -16,8 +19,126 @@ public class VTUF3DLoop
 //	public final static int FOUR = 3;
 //	public final static int FIVE = 4;
 //	public final static int SIX = 5;
-	
 
+	// ====== PARALLEL PROCESSING CONFIGURATION ======
+	// Set to true to enable parallel processing (recommended for large grids)
+	public static boolean PARALLEL_ENABLED = true;
+
+	// Number of threads to use (0 = use all available processors)
+	public static int NUM_THREADS = 0;
+
+	// ====== VIEW FACTOR CACHE CONFIGURATION ======
+	// Set to true to cache view factors to disk for faster subsequent runs
+	// The cache is automatically invalidated when geometry changes (al2, aw2, bh, numsfc2)
+	public static boolean VIEW_FACTOR_CACHE_ENABLED = true;
+
+	// ForkJoinPool for parallel processing
+	private static ForkJoinPool parallelPool = null;
+
+	// Progress tracker for ETA reporting
+	private static ProgressTracker progressTracker = null;
+
+	// Array pool for reducing GC pressure
+	private static ArrayPool arrayPool = null;
+
+	/**
+	 * Initialize the parallel processing pool and other performance components.
+	 * Call this once before running simulations.
+	 */
+	public static void initParallelPool() {
+		if (PARALLEL_ENABLED && parallelPool == null) {
+			int threads = NUM_THREADS > 0 ? NUM_THREADS : Runtime.getRuntime().availableProcessors();
+			parallelPool = new ForkJoinPool(threads);
+			System.out.println("Parallel processing enabled with " + threads + " threads");
+		}
+
+		// Initialize array pool
+		if (arrayPool == null) {
+			arrayPool = ArrayPool.getInstance();
+		}
+
+		// Initialize progress tracker
+		if (progressTracker == null) {
+			progressTracker = new ProgressTracker();
+		}
+	}
+
+	/**
+	 * Shutdown the parallel pool and cleanup resources.
+	 */
+	public static void shutdownParallelPool() {
+		if (parallelPool != null) {
+			parallelPool.shutdown();
+			parallelPool = null;
+		}
+
+		// Print array pool stats and cleanup
+		if (arrayPool != null) {
+			System.out.println(arrayPool.getStats());
+			arrayPool.clear();
+		}
+
+		// Finish progress tracking
+		if (progressTracker != null) {
+			progressTracker.finish();
+			progressTracker = null;
+		}
+	}
+
+	/**
+	 * Newton's method solver for surface temperature.
+	 * This is extracted to allow parallel processing.
+	 */
+	private static double solveNewtonTsfc(
+			double Tsfc_init, double emiss, double sigma,
+			double httc, double lambda_sfc, double thickness,
+			double Rnet, double Tconv, double layerTemp) {
+
+		double Tnew = Tsfc_init;
+		double Told = Tnew + 999.0;
+		double Fold, Fold_prime;
+		int patchItrCount = 0;
+		int httcRetries = 0;
+		double httcLocal = httc;
+
+		while (Math.abs(Tnew - Told) > Constants.NEWTON_CONVERGENCE_TOLERANCE) {
+			Told = Tnew;
+
+			double conduction = lambda_sfc * 2.0 / thickness;
+
+			Fold = emiss * sigma * Math.pow(Told, 4)
+					+ (httcLocal + conduction) * Told
+					- Rnet - httcLocal * Tconv
+					- lambda_sfc * layerTemp * 2.0 / thickness;
+
+			Fold_prime = 4.0 * emiss * sigma * Math.pow(Told, 3)
+					+ httcLocal + conduction;
+
+			Tnew = -Fold / Fold_prime + Told;
+
+			if (Double.isNaN(Tnew)) {
+				return Tsfc_init;
+			}
+
+			patchItrCount++;
+			if (patchItrCount > Constants.NEWTON_MAX_ITERATIONS) {
+				if (httcLocal < 0) {
+					httcLocal += Constants.NEWTON_HTTC_ADJUSTMENT;
+				} else {
+					httcLocal -= Constants.NEWTON_HTTC_ADJUSTMENT;
+				}
+				patchItrCount = 0;
+				httcRetries++;
+
+				if (httcRetries > Constants.NEWTON_MAX_HTTC_RETRIES) {
+					return Tsfc_init;
+				}
+			}
+		}
+
+		return Tnew;
+	}
+	// ====== END PARALLEL PROCESSING CONFIGURATION ======
 
 	public static void main(String[] args)
 	{
@@ -46,6 +167,9 @@ public class VTUF3DLoop
 			boolean sum_out, boolean matlab_out, boolean writeTsfc, boolean writeKl, boolean writeKabs, boolean writeKrefl, boolean writeLabs, 
 			boolean writeLrefl, boolean writeLdown, boolean writeTmrt, boolean writeUtci, boolean writeEnergyBalances, double strorint, double xlatint, int badKdn, int year)
 	{
+		// Initialize parallel processing pool
+		initParallelPool();
+
 		int minres_bh;
 		int par_ab, numsfc_ab, numsfc2, jab;
 		double hwactual;
@@ -177,8 +301,8 @@ public class VTUF3DLoop
 		double[] reflps;
 		double[] reflpl;
 		double[] vf2;
-		double[] vf3;
-		int[] vf3j;
+		double[] vf3 = null;
+		int[] vf3j = null;
 		int[] vf2j;
 		double[][] vertex;
 		double[][] face;
@@ -737,27 +861,73 @@ public class VTUF3DLoop
 				vfppos = new int[numsfc_ab + 1];
 				vfipos = new int[numsfc_ab + 1];
 				mend = new int[numsfc_ab];
-				refl_emist = new double[numsfc_ab];
-				absbs = new double[numsfc_ab];
-				absbl = new double[numsfc_ab];
-				tots = new double[numsfc_ab];
-				totl = new double[numsfc_ab];
-				refls = new double[numsfc_ab];
-				refll = new double[numsfc_ab];
-				reflts = new double[numsfc_ab];
-				refltl = new double[numsfc_ab];
-				reflps = new double[numsfc_ab];
-				reflpl = new double[numsfc_ab];
-				Tsfc = new double[numsfc_ab];
-				Trad = new double[numsfc_ab];
-				lambda_sfc = new double[numsfc_ab];
-				Qh = new double[numsfc_ab];
-				Qe = new double[numsfc_ab];
+				// Use ArrayPool for frequently reallocated arrays to reduce GC pressure
+				refl_emist = arrayPool.acquireDouble(numsfc_ab);
+				absbs = arrayPool.acquireDouble(numsfc_ab);
+				absbl = arrayPool.acquireDouble(numsfc_ab);
+				tots = arrayPool.acquireDouble(numsfc_ab);
+				totl = arrayPool.acquireDouble(numsfc_ab);
+				refls = arrayPool.acquireDouble(numsfc_ab);
+				refll = arrayPool.acquireDouble(numsfc_ab);
+				reflts = arrayPool.acquireDouble(numsfc_ab);
+				refltl = arrayPool.acquireDouble(numsfc_ab);
+				reflps = arrayPool.acquireDouble(numsfc_ab);
+				reflpl = arrayPool.acquireDouble(numsfc_ab);
+				Tsfc = arrayPool.acquireDouble(numsfc_ab);
+				Trad = arrayPool.acquireDouble(numsfc_ab);
+				lambda_sfc = arrayPool.acquireDouble(numsfc_ab);
+				Qh = arrayPool.acquireDouble(numsfc_ab);
+				Qe = arrayPool.acquireDouble(numsfc_ab);
 
-				currentRnet = new double[numsfc_ab];
-				currentQe = new double[numsfc_ab];
-				currentQh = new double[numsfc_ab];
-				currentQg = new double[numsfc_ab];
+				currentRnet = arrayPool.acquireDouble(numsfc_ab);
+				currentQe = arrayPool.acquireDouble(numsfc_ab);
+				currentQh = arrayPool.acquireDouble(numsfc_ab);
+				currentQg = arrayPool.acquireDouble(numsfc_ab);
+
+				// Arrays for parallel processing - store per-patch intermediate values
+				double[] httc_patch = arrayPool.acquireDouble(numsfc_ab);
+				double[] Rnet_patch = arrayPool.acquireDouble(numsfc_ab);
+				double[] Tconv_patch = arrayPool.acquireDouble(numsfc_ab);
+
+				// Per-cell surface properties for spatial variation (if specified in treemap.dat)
+				double[][] cellAlbedoMap = null;
+				double[][] cellEmissivityMap = null;
+				boolean hasCellProperties = treeMapFromConfig.hasCellProperties;
+				if (hasCellProperties)
+				{
+					// Initialize per-cell property maps
+					int domainWidth = treeMapFromConfig.width;
+					int domainLength = treeMapFromConfig.length;
+					cellAlbedoMap = new double[domainWidth][domainLength];
+					cellEmissivityMap = new double[domainWidth][domainLength];
+
+					// Fill with default values
+					for (int xi = 0; xi < domainWidth; xi++)
+					{
+						for (int yi = 0; yi < domainLength; yi++)
+						{
+							cellAlbedoMap[xi][yi] = albs;  // Default to global street albedo
+							cellEmissivityMap[xi][yi] = emiss;  // Default to global street emissivity
+						}
+					}
+
+					// Populate from treemap config (1D array indexed as x * length + y)
+					int numCells = treeMapFromConfig.cellAlbedo.length;
+					System.out.println("Loading per-cell surface properties for " + numCells + " cells");
+					for (int idx = 0; idx < numCells; idx++)
+					{
+						int xi = idx / domainLength;
+						int yi = idx % domainLength;
+						if (xi < domainWidth && yi < domainLength)
+						{
+							cellAlbedoMap[xi][yi] = treeMapFromConfig.cellAlbedo[idx];
+							cellEmissivityMap[xi][yi] = treeMapFromConfig.cellEmissivity[idx];
+						}
+					}
+					System.out.println("Per-cell properties loaded: albedo range [" +
+						treeMapFromConfig.cellAlbedo[0] + " - " +
+						treeMapFromConfig.cellAlbedo[numCells-1] + "]");
+				}
 
 				//  SFC_AB ARRAY (second dimension) - central urban unit; only patches to have 'history'
 				//  1: i (sfc array)
@@ -863,12 +1033,22 @@ public class VTUF3DLoop
 
 									//  set the roof, wall, and road albedos and emissivities
 									//  and temperatures, and thermal properties and thicknesses
-									if (f == TUFreg3D.FACE_ONE && z == 0) 
+									if (f == TUFreg3D.FACE_ONE && z == 0)
 									{
 										sfc[iIndex12][Constants.sfc_surface_type] = 2.;
-										sfc[iIndex12][Constants.sfc_albedo] = albs;
-										sfc[iIndex12][Constants.sfc_emiss] = emiss;
-										// if this is a Maespa vegetation surface, set different albedo/emissivity
+										// Use per-cell properties if available, otherwise global values
+										if (hasCellProperties && cellAlbedoMap != null && x > 0 && y > 0 &&
+											x <= cellAlbedoMap.length && y <= cellAlbedoMap[0].length)
+										{
+											sfc[iIndex12][Constants.sfc_albedo] = cellAlbedoMap[x-1][y-1];
+											sfc[iIndex12][Constants.sfc_emiss] = cellEmissivityMap[x-1][y-1];
+										}
+										else
+										{
+											sfc[iIndex12][Constants.sfc_albedo] = albs;
+											sfc[iIndex12][Constants.sfc_emiss] = emiss;
+										}
+										// if this is a Maespa vegetation surface, override with vegetation properties
 										if (treeXYTreeMap[x-1][y-1] > 0)
 										{
 											// !print *,'surface i=',i,' is vegetation'
@@ -1180,9 +1360,36 @@ public class VTUF3DLoop
 
 				// int x,y,z;
 				// ------------------------------------------------------------------
-				//  View Factor Calculations (or read in from file)
-System.out.println("++++++++++++++++++++++++start vfcalc=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60. );		
-				if (vfcalc == 0)
+				//  View Factor Calculations (or read in from file/cache)
+System.out.println("++++++++++++++++++++++++start vfcalc=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60. );
+
+				// ====== VIEW FACTOR CACHE CHECK ======
+				boolean loadedFromCache = false;
+				String workingDir = System.getProperty("user.dir");
+
+				if (VIEW_FACTOR_CACHE_ENABLED && ViewFactorCache.cacheExists(workingDir, al2, aw2, bh, numsfc2))
+				{
+					ViewFactorCache.CacheData cacheData = ViewFactorCache.loadCache(workingDir);
+					if (cacheData != null)
+					{
+						// Load data from cache
+						numvf = cacheData.numvf;
+						vf3 = cacheData.vf3;
+						vf3j = cacheData.vf3j;
+						vfppos = cacheData.vfppos;
+
+						// Restore sfc_evf values
+						for (int sfcIdx = 0; sfcIdx < cacheData.sfc_evf.length && sfcIdx < numsfc; sfcIdx++)
+						{
+							sfc[sfcIdx][Constants.sfc_evf] = cacheData.sfc_evf[sfcIdx];
+						}
+
+						loadedFromCache = true;
+						System.out.println("View factors loaded from cache - skipping calculation");
+					}
+				}
+
+				if (!loadedFromCache && vfcalc == 0)
 				{
 					// going to always calculate
 					//
@@ -1201,7 +1408,7 @@ System.out.println("++++++++++++++++++++++++start vfcalc=" + (System.currentTime
 					// read(unit=vfinfoDat,rec=numsfc2+2)vfipos(numsfc2+1);
 					// close(vfinfoDat);
 				}
-				else
+				else if (!loadedFromCache)
 				{
 
 					System.out.println("CALCULATING VIEW FACTORS...");
@@ -1237,7 +1444,7 @@ System.out.println("++++++++++++++++++++++++start vfcalc=" + (System.currentTime
 						fzz[k] = fz[k];
 					}
 
-					
+
 
 					double fact2 = 500000.;
 
@@ -1692,19 +1899,30 @@ System.out.println("++++++++++++++++++++++++start vfcalc=" + (System.currentTime
 				}
 
 				// Move this section outside of the if so that vf3 and vf3j scope remains for the later use
-				vf3 = new double[numvf];
-				vf3j = new int[numvf];
-
-				//  arrays of view factors
-				for (int k = 0; k < numvf; k++)
+				// Only copy from vf2 arrays if we didn't load from cache
+				if (!loadedFromCache)
 				{
-					vf3[k] = vf2[k];
-					vf3j[k] = vf2j[k];
+					vf3 = new double[numvf];
+					vf3j = new int[numvf];
+
+					//  arrays of view factors
+					for (int k = 0; k < numvf; k++)
+					{
+						vf3[k] = vf2[k];
+						vf3j[k] = vf2j[k];
+					}
+
+					// ====== SAVE VIEW FACTOR CACHE ======
+					if (VIEW_FACTOR_CACHE_ENABLED)
+					{
+						ViewFactorCache.saveCache(workingDir, al2, aw2, bh, numsfc2,
+							numvf, vf3, vf3j, vfppos, sfc, numsfc);
+					}
 				}
 
 				// ------------------------------------------------------------------
 
-				if (vfcalc == 0)
+				if (!loadedFromCache && vfcalc == 0)
 				{
 
 					vf3 = new double[numvf];
@@ -1781,7 +1999,8 @@ System.out.println("++++++++++++++++++++++++start vfcalc=" + (System.currentTime
 
 				}
 
-				if (numvf != p )
+				// Skip this validation if loaded from cache (p won't be set correctly)
+				if (!loadedFromCache && numvf != p)
 				{
 					System.out.println("PROBLEM WITH VFs IN MEM" + " " + (p ) + " " + numvf);
 				}
@@ -2009,11 +2228,20 @@ System.out.println(Tcan + " " + Tafrc[TUFreg3D.restartedRunStartTimestep]);
 						// //!print *,'after 922'
 						//
 						// ywrite=true;
-System.out.println("++++++++++++++++++++++++start main time=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60 );	
+System.out.println("++++++++++++++++++++++++start main time=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60 );
 						//  START OF MAIN TIME
 						// LOOP----------------------------------------
+						// Start progress tracking
+						if (progressTracker != null) {
+							progressTracker.start(starttime, timeend);
+						}
+
 						while (timeis <= timeend)
 						{
+							// Update progress tracker
+							if (progressTracker != null) {
+								progressTracker.update(timeis);
+							}
 //System.out.println("++++++++++++++++++++++++start next while main time=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60 );								
 							// do 309 while (timeis<=timeend)
 							// !print *,'start 309'
@@ -2269,18 +2497,25 @@ if (Kbeam > 10000)
 
 							if (Ktot > 1.0E-3)
 							{
-//System.out.println("++++++++++++++++++++++++start Shade=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60. );	
 								//  Solar shading of patches
 								// -----------------------------------------
-								//TODO figure out how to replace TestflxData, variable TD (total transission) with online Maespa
-										HashMap shadeReturn = Shade.shade(stror, az, ralt, ypos, surf, surf_shade, al2, aw2,
-										maxbh, par, sfc, numsfc, a1, a2, b1, b2, numsfc2, sfc_ab, par_ab, veg_shade,
-										timeis, yd_actual, treeXYMapSunlightPercentageTotal, treeXYMap,
-										maespaTestflxData);
+								HashMap shadeReturn;
+								if (PARALLEL_ENABLED && parallelPool != null) {
+									// Use parallel shade calculation
+									shadeReturn = Shade.shadeParallel(stror, az, ralt, ypos, surf, surf_shade, al2, aw2,
+											maxbh, par, sfc, numsfc, a1, a2, b1, b2, numsfc2, sfc_ab, par_ab, veg_shade,
+											timeis, yd_actual, treeXYMapSunlightPercentageTotal, treeXYMap,
+											maespaTestflxData, parallelPool);
+								} else {
+									// Fall back to sequential
+									shadeReturn = Shade.shade(stror, az, ralt, ypos, surf, surf_shade, al2, aw2,
+											maxbh, par, sfc, numsfc, a1, a2, b1, b2, numsfc2, sfc_ab, par_ab, veg_shade,
+											timeis, yd_actual, treeXYMapSunlightPercentageTotal, treeXYMap,
+											maespaTestflxData);
+								}
 								sfc = (double[][]) shadeReturn.get("sfc");
 								sfc_ab = (double[][]) shadeReturn.get("sfc_ab");
 								treeXYMapSunlightPercentageTotal = (double[][]) shadeReturn.get("treeXYMapSunlightPercentageTotal");
-//System.out.println("++++++++++++++++++++++++end Shade=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60. );	
 							}
 
 							for (int iabCount = 0; iabCount < numsfc_ab; iabCount++)
@@ -2329,7 +2564,7 @@ if (Kbeam > 10000)
 									while ((k < 2) || (refldiff >= dalb * (1. - lambdapR)))
 									{
 										k = k + 1;
-										if (k > 20) // otherwise, we seem to get trapped in this loop
+										if (k > Constants.MAX_REFLECTION_ITERATIONS)
 										{
 											// exit ;
 											break;
@@ -2354,31 +2589,78 @@ if (Kbeam > 10000)
 												refltl[iabCount] = 0.;
 											}
 										}
-										// open view factor files
-										for (int iabCount = 0; iabCount < numsfc2; iabCount++)
-										{
-											int iIndex5 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
-											// do p=vfppos[iab],vfppos[iab+1]-1
-											for (int pCount = vfppos[iabCount]; pCount < vfppos[iabCount + 1]  ; pCount++)
-											{
-												vf = vf3[pCount];
-												jab = vf3j[pCount];
-												absbl[iabCount] = absbl[iabCount] + vf * reflpl[jab] * sfc[iIndex5][Constants.sfc_emiss];
-												if (absbl[iabCount] > 2000.)
-												{
-													// write(6,*)"2,iab,absbl[iab]",iab,absbl[iab]
+										// open view factor files - PARALLELIZED for performance (longwave only)
+										final DoubleAdder Lup_accLW = new DoubleAdder();
+										final DoubleAdder Lup_refl_accLW = new DoubleAdder();
+										Lup_accLW.add(Lup);
+										Lup_refl_accLW.add(Lup_refl);
+
+										// Capture final references for lambda
+										final double[][] sfc_finalLW = sfc;
+										final double[][] sfc_ab_finalLW = sfc_ab;
+										final double[] vf3_finalLW = vf3;
+										final int[] vf3j_finalLW = vf3j;
+										final int[] vfppos_finalLW = vfppos;
+										final double[] reflpl_finalLW = reflpl;
+										final double[] absbl_finalLW = absbl;
+										final double[] refll_finalLW = refll;
+										final int numsfc2_finalLW = numsfc2;
+
+										if (PARALLEL_ENABLED && parallelPool != null && numsfc2 > 100) {
+											try {
+												parallelPool.submit(() ->
+													IntStream.range(0, numsfc2_finalLW).parallel().forEach(patchIdx -> {
+														int iIdx5 = (int) sfc_ab_finalLW[patchIdx][Constants.sfc_ab_i];
+														for (int pCnt = vfppos_finalLW[patchIdx]; pCnt < vfppos_finalLW[patchIdx + 1]; pCnt++) {
+															double vfVal = vf3_finalLW[pCnt];
+															int jabVal = vf3j_finalLW[pCnt];
+															absbl_finalLW[patchIdx] += vfVal * reflpl_finalLW[jabVal] * sfc_finalLW[iIdx5][Constants.sfc_emiss];
+															refll_finalLW[patchIdx] += vfVal * reflpl_finalLW[jabVal] * (1. - sfc_finalLW[iIdx5][Constants.sfc_emiss]);
+														}
+
+														if (sfc_finalLW[iIdx5][Constants.sfc_in_array] > 1.5) {
+															Lup_accLW.add((1. - sfc_finalLW[iIdx5][Constants.sfc_evf]) * reflpl_finalLW[patchIdx]);
+															Lup_refl_accLW.add((1. - sfc_finalLW[iIdx5][Constants.sfc_evf]) * reflpl_finalLW[patchIdx]);
+														}
+													})
+												).get();
+											} catch (Exception e) {
+												// Fall back to sequential on error
+												System.err.println("Parallel LW view factor calc failed: " + e.getMessage());
+												for (int iabCount = 0; iabCount < numsfc2; iabCount++) {
+													int iIndex5 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
+													for (int pCount = vfppos[iabCount]; pCount < vfppos[iabCount + 1]; pCount++) {
+														vf = vf3[pCount];
+														jab = vf3j[pCount];
+														absbl[iabCount] += vf * reflpl[jab] * sfc[iIndex5][Constants.sfc_emiss];
+														refll[iabCount] += vf * reflpl[jab] * (1. - sfc[iIndex5][Constants.sfc_emiss]);
+													}
+													if (sfc[iIndex5][Constants.sfc_in_array] > 1.5) {
+														Lup_accLW.add((1. - sfc[iIndex5][Constants.sfc_evf]) * reflpl[iabCount]);
+														Lup_refl_accLW.add((1. - sfc[iIndex5][Constants.sfc_evf]) * reflpl[iabCount]);
+													}
 												}
-												refll[iabCount] = refll[iabCount] + vf * reflpl[jab] * (1. - sfc[iIndex5][Constants.sfc_emiss]);
 											}
-
-											if (sfc[iIndex5][Constants.sfc_in_array] > 1.5)
-											{
-												Lup = Lup + (1. - sfc[iIndex5][Constants.sfc_evf]) * reflpl[iabCount];
-												Lup_refl = Lup_refl + (1. - sfc[iIndex5][Constants.sfc_evf]) * reflpl[iabCount];
+										} else {
+											// Sequential fallback
+											for (int iabCount = 0; iabCount < numsfc2; iabCount++) {
+												int iIndex5 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
+												for (int pCount = vfppos[iabCount]; pCount < vfppos[iabCount + 1]; pCount++) {
+													vf = vf3[pCount];
+													jab = vf3j[pCount];
+													absbl[iabCount] += vf * reflpl[jab] * sfc[iIndex5][Constants.sfc_emiss];
+													refll[iabCount] += vf * reflpl[jab] * (1. - sfc[iIndex5][Constants.sfc_emiss]);
+												}
+												if (sfc[iIndex5][Constants.sfc_in_array] > 1.5) {
+													Lup_accLW.add((1. - sfc[iIndex5][Constants.sfc_evf]) * reflpl[iabCount]);
+													Lup_refl_accLW.add((1. - sfc[iIndex5][Constants.sfc_evf]) * reflpl[iabCount]);
+												}
 											}
-
-											
 										}
+
+										// Transfer accumulated values back
+										Lup = Lup_accLW.sum();
+										Lup_refl = Lup_refl_accLW.sum();
 
 										for (int iabCount = 0; iabCount < numsfc2; iabCount++)
 										{
@@ -2536,6 +2818,11 @@ if (Kbeam > 10000)
 										// (k<2||refldiff>=dalb*(1.-lambdapR))
 										k = k + 1;
 
+										// Limit iterations for performance
+										if (k > Constants.MAX_REFLECTION_ITERATIONS) {
+											break;
+										}
+
 										// save reflected values from last reflection
 										for (int iabCount = 0; iabCount < numsfc_ab; iabCount++)
 										{
@@ -2559,30 +2846,100 @@ if (Kbeam > 10000)
 											}
 										}
 
-										// open view factor files
-										for (int iabCount = 0; iabCount < numsfc2; iabCount++)
-										{
-											int iIndex8 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
-											for (int pCount = vfppos[iabCount]; pCount < vfppos[iabCount + 1] ; pCount++)
-											{
-												vf = vf3[pCount];
-												jab = vf3j[pCount];
-												absbs[iabCount] = absbs[iabCount] + vf * reflps[jab] * (1. - sfc[iIndex8][Constants.sfc_albedo]);
-//if (iabCount==0) System.out.println("absbs[iabCount]3 " + absbs[iabCount]);
-												refls[iabCount] = refls[iabCount] + vf * reflps[jab] * sfc[iIndex8][Constants.sfc_albedo];
-												absbl[iabCount] = absbl[iabCount] + vf * reflpl[jab] * sfc[iIndex8][Constants.sfc_emiss];
-												refll[iabCount] = refll[iabCount] + vf * reflpl[jab] * (1. - sfc[iIndex8][Constants.sfc_emiss]);
-											}
+										// open view factor files - PARALLELIZED for performance
+										// Use atomic accumulators for thread-safe reduction
+										final DoubleAdder Kup_acc = new DoubleAdder();
+										final DoubleAdder Lup_acc = new DoubleAdder();
+										final DoubleAdder Lup_refl_acc = new DoubleAdder();
+										final DoubleAdder Kup_refl_acc = new DoubleAdder();
+										Kup_acc.add(Kup);
+										Lup_acc.add(Lup);
+										Lup_refl_acc.add(Lup_refl);
+										Kup_refl_acc.add(Kup_refl);
 
-											if (sfc[iIndex8][Constants.sfc_in_array] > 1.5)
-											{
-												Kup = Kup + (1. - sfc[iIndex8][Constants.sfc_evf]) * reflps[iabCount];
-												Lup = Lup + (1. - sfc[iIndex8][Constants.sfc_evf]) * reflpl[iabCount];
-												Lup_refl = Lup_refl + (1. - sfc[iIndex8][Constants.sfc_evf]) * reflpl[iabCount];
-												Kup_refl = Kup_refl + (1. - sfc[iIndex8][Constants.sfc_evf]) * reflps[iabCount];
-											}
+										// Capture final references for lambda
+										final double[][] sfc_final = sfc;
+										final double[][] sfc_ab_final = sfc_ab;
+										final double[] vf3_final = vf3;
+										final int[] vf3j_final = vf3j;
+										final int[] vfppos_final = vfppos;
+										final double[] reflps_final = reflps;
+										final double[] reflpl_final = reflpl;
+										final double[] absbs_final = absbs;
+										final double[] refls_final = refls;
+										final double[] absbl_final = absbl;
+										final double[] refll_final = refll;
+										final int numsfc2_final = numsfc2;
 
+										if (PARALLEL_ENABLED && parallelPool != null && numsfc2 > 100) {
+											try {
+												parallelPool.submit(() ->
+													IntStream.range(0, numsfc2_final).parallel().forEach(patchIdx -> {
+														int iIdx8 = (int) sfc_ab_final[patchIdx][Constants.sfc_ab_i];
+														for (int pCnt = vfppos_final[patchIdx]; pCnt < vfppos_final[patchIdx + 1]; pCnt++) {
+															double vfVal = vf3_final[pCnt];
+															int jabVal = vf3j_final[pCnt];
+															absbs_final[patchIdx] += vfVal * reflps_final[jabVal] * (1. - sfc_final[iIdx8][Constants.sfc_albedo]);
+															refls_final[patchIdx] += vfVal * reflps_final[jabVal] * sfc_final[iIdx8][Constants.sfc_albedo];
+															absbl_final[patchIdx] += vfVal * reflpl_final[jabVal] * sfc_final[iIdx8][Constants.sfc_emiss];
+															refll_final[patchIdx] += vfVal * reflpl_final[jabVal] * (1. - sfc_final[iIdx8][Constants.sfc_emiss]);
+														}
+
+														if (sfc_final[iIdx8][Constants.sfc_in_array] > 1.5) {
+															Kup_acc.add((1. - sfc_final[iIdx8][Constants.sfc_evf]) * reflps_final[patchIdx]);
+															Lup_acc.add((1. - sfc_final[iIdx8][Constants.sfc_evf]) * reflpl_final[patchIdx]);
+															Lup_refl_acc.add((1. - sfc_final[iIdx8][Constants.sfc_evf]) * reflpl_final[patchIdx]);
+															Kup_refl_acc.add((1. - sfc_final[iIdx8][Constants.sfc_evf]) * reflps_final[patchIdx]);
+														}
+													})
+												).get();
+											} catch (Exception e) {
+												// Fall back to sequential on error
+												System.err.println("Parallel view factor calc failed: " + e.getMessage());
+												for (int iabCount = 0; iabCount < numsfc2; iabCount++) {
+													int iIndex8 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
+													for (int pCount = vfppos[iabCount]; pCount < vfppos[iabCount + 1]; pCount++) {
+														vf = vf3[pCount];
+														jab = vf3j[pCount];
+														absbs[iabCount] += vf * reflps[jab] * (1. - sfc[iIndex8][Constants.sfc_albedo]);
+														refls[iabCount] += vf * reflps[jab] * sfc[iIndex8][Constants.sfc_albedo];
+														absbl[iabCount] += vf * reflpl[jab] * sfc[iIndex8][Constants.sfc_emiss];
+														refll[iabCount] += vf * reflpl[jab] * (1. - sfc[iIndex8][Constants.sfc_emiss]);
+													}
+													if (sfc[iIndex8][Constants.sfc_in_array] > 1.5) {
+														Kup_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflps[iabCount]);
+														Lup_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflpl[iabCount]);
+														Lup_refl_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflpl[iabCount]);
+														Kup_refl_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflps[iabCount]);
+													}
+												}
+											}
+										} else {
+											// Sequential fallback
+											for (int iabCount = 0; iabCount < numsfc2; iabCount++) {
+												int iIndex8 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
+												for (int pCount = vfppos[iabCount]; pCount < vfppos[iabCount + 1]; pCount++) {
+													vf = vf3[pCount];
+													jab = vf3j[pCount];
+													absbs[iabCount] += vf * reflps[jab] * (1. - sfc[iIndex8][Constants.sfc_albedo]);
+													refls[iabCount] += vf * reflps[jab] * sfc[iIndex8][Constants.sfc_albedo];
+													absbl[iabCount] += vf * reflpl[jab] * sfc[iIndex8][Constants.sfc_emiss];
+													refll[iabCount] += vf * reflpl[jab] * (1. - sfc[iIndex8][Constants.sfc_emiss]);
+												}
+												if (sfc[iIndex8][Constants.sfc_in_array] > 1.5) {
+													Kup_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflps[iabCount]);
+													Lup_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflpl[iabCount]);
+													Lup_refl_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflpl[iabCount]);
+													Kup_refl_acc.add((1. - sfc[iIndex8][Constants.sfc_evf]) * reflps[iabCount]);
+												}
+											}
 										}
+
+										// Transfer accumulated values back
+										Kup = Kup_acc.sum();
+										Lup = Lup_acc.sum();
+										Lup_refl = Lup_refl_acc.sum();
+										Kup_refl = Kup_refl_acc.sum();
 
 										for (int iabCount = 0; iabCount < numsfc2; iabCount++)
 										{
@@ -2907,93 +3264,105 @@ if (Kbeam > 10000)
 
 								// ! stop
 
-								Tnew = Tsfc[iabCount];
+								// Store values for parallel Newton's method (Phase 2) and accumulations (Phase 3)
+								httc_patch[iabCount] = httc;
+								Rnet_patch[iabCount] = Rnet;
+								Tconv_patch[iabCount] = Tconv;
+							} // End Phase 1 loop
 
-								Told = Tnew + 999.;
-//System.out.println("++++++++++++++++++++++++start Tsfc newton=" + (System.currentTimeMillis() - TUFreg3D.startTime)/1000./60. );	
-								// ITERATION to solve individual patch Tsfc[i] by Newton's method----
-								int patchItrCount = 0;
-								int httcRetries = 0;
-								while (Math.abs(Tnew - Told) > 0.001)
-								{
-//									if (iabCount == 399 || iabCount == 398)
-//									{
-//										System.out.println(	 "|  " + iabCount + " " + 	
-//											Told+ " "+
-//											httc + " "+
-//											Rnet + " "+
-//											Tconv+ " "+
-//											sfc_ab[iabCount][Constants.sfc_ab_layer_temp] 									
-//										);
-//										System.out.println("||| " + sfc[iIndex10][Constants.sfc_emiss] + " " +
-//												sigma + " " + 
-//												lambda_sfc[iabCount] + " " + 
-//												sfc_ab[iabCount][sixPlusThreeTimesNumlayers] + " " + 
-//												Tnew
-//														);
-//									}
-									Told = Tnew;
-									Fold = sfc[iIndex10][Constants.sfc_emiss] * sigma * Math.pow(Told, 4)
-											+ (httc + lambda_sfc[iabCount] * 2. / sfc_ab[iabCount][sixPlusThreeTimesNumlayers]) * Told - Rnet - httc * Tconv
-											- lambda_sfc[iabCount] * sfc_ab[iabCount][Constants.sfc_ab_layer_temp] * 2. / sfc_ab[iabCount][sixPlusThreeTimesNumlayers];
-									Fold_prime = 4. * sfc[iIndex10][Constants.sfc_emiss] * sigma * Math.pow(Told, 3) + httc
-											+ lambda_sfc[iabCount] * 2. / sfc_ab[iabCount][sixPlusThreeTimesNumlayers];
-									Tnew = -Fold / Fold_prime + Told;
-									if (Double.isNaN(Tnew))
-									{
-										System.out.println();
+							// ====== PHASE 2: Parallel Newton's method temperature solver ======
+							final int numsfc2Final = numsfc2;
+							final double sigmaFinal = sigma;
+							final int sixPlusThreeTimesNumlayersFinal = sixPlusThreeTimesNumlayers;
+							// Final references for lambda access
+							final double[][] sfc_ab_final = sfc_ab;
+							final double[][] sfc_final = sfc;
+							final double[] Tsfc_final = Tsfc;
+							final double[] httc_patch_final = httc_patch;
+							final double[] lambda_sfc_final = lambda_sfc;
+							final double[] Rnet_patch_final = Rnet_patch;
+							final double[] Tconv_patch_final = Tconv_patch;
+
+							if (PARALLEL_ENABLED && parallelPool != null)
+							{
+								// Parallel execution of Newton's method
+								final double[] TdiffArray = new double[numsfc2];
+								try {
+									parallelPool.submit(() -> {
+										IntStream.range(0, numsfc2Final).parallel().forEach(idx -> {
+											int iIdx = (int) sfc_ab_final[idx][Constants.sfc_ab_i];
+											double patchEmissivity = sfc_final[iIdx][Constants.sfc_emiss];
+											double patchThick = sfc_ab_final[idx][sixPlusThreeTimesNumlayersFinal];
+											double patchTemp = sfc_ab_final[idx][Constants.sfc_ab_layer_temp];
+
+											double newTemp = solveNewtonTsfc(
+												Tsfc_final[idx],
+												patchEmissivity,
+												sigmaFinal,
+												httc_patch_final[idx],
+												lambda_sfc_final[idx],
+												patchThick,
+												Rnet_patch_final[idx],
+												Tconv_patch_final[idx],
+												patchTemp
+											);
+
+											TdiffArray[idx] = Math.abs(newTemp - Tsfc_final[idx]);
+											Tsfc_final[idx] = newTemp;
+										});
+									}).get();
+								} catch (Exception e) {
+									System.err.println("Parallel Newton solver error: " + e.getMessage());
+									e.printStackTrace();
+								}
+								// Find max Tdiff
+								for (int idx = 0; idx < numsfc2; idx++) {
+									if (TdiffArray[idx] > Tdiffmax) {
+										Tdiffmax = TdiffArray[idx];
 									}
-//									System.out.println(patchItrCount + " " + Tnew + " " + Told + " " + Fold + " " + Fold_prime);
-									//  fails with 0 200.50485379623788 291.15 255.04996909525653 2.813718988570301
-									patchItrCount++;
-									if (patchItrCount > 40)
+								}
+							}
+							else
+							{
+								// Sequential fallback
+								for (int iabCount = 0; iabCount < numsfc2; iabCount++)
+								{
+									int iIndex10 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
+									double patchEmiss = sfc[iIndex10][Constants.sfc_emiss];
+									double patchThickness = sfc_ab[iabCount][sixPlusThreeTimesNumlayers];
+									double patchLayerTemp = sfc_ab[iabCount][Constants.sfc_ab_layer_temp];
+
+									Tnew = solveNewtonTsfc(
+										Tsfc[iabCount],
+										patchEmiss,
+										sigma,
+										httc_patch[iabCount],
+										lambda_sfc[iabCount],
+										patchThickness,
+										Rnet_patch[iabCount],
+										Tconv_patch[iabCount],
+										patchLayerTemp
+									);
+
+									if (Math.abs(Tnew - Tsfc[iabCount]) > Tdiffmax)
 									{
-										System.out.println("too many iterations in Tsfc");
-										System.out.println("modifying httc " + httc );
-										if (httc < 0)
-										{
-											httc = httc + 0.5;
-										}
-										else
-										{
-											httc = httc - 0.5;
-										}
-										patchItrCount = 0;
-										if (httcRetries > 10)
-										{
-											System.out.println("Too many httc retries");
-											
-											System.out.println(	 "|  " + iabCount + " " + 	
-											Told+ " "+
-											httc + " "+
-											Rnet + " "+
-											Tconv+ " "+
-											sfc_ab[iabCount][Constants.sfc_ab_layer_temp] 									
-										);
-										System.out.println("||| " + sfc[iIndex10][Constants.sfc_emiss] + " " +
-												sigma + " " + 
-												lambda_sfc[iabCount] + " " + 
-												sfc_ab[iabCount][sixPlusThreeTimesNumlayers] + " " + 
-												Tnew
-														);
-										System.out.println(patchItrCount + " " + Tnew + " " + Told + " " + Fold + " " + Fold_prime);
-											
-											System.exit(1);
-										}
-										httcRetries ++;
+										Tdiffmax = Math.abs(Tnew - Tsfc[iabCount]);
 									}
-									
-									// 899 continue
+									Tsfc[iabCount] = Tnew;
 								}
-								if (Math.abs(Tnew - Tsfc[iabCount]) > Tdiffmax)
-								{
-									Tdiffmax = Math.abs(Tnew - Tsfc[iabCount]);
-								}
-								if (Double.isNaN(Tnew))
-								{
-									System.out.println();
-								}
-								Tsfc[iabCount] = Tnew;
+							}
+
+							// ====== PHASE 3: Calculate Trad and accumulations (sequential) ======
+							for (int iabCount = 0; iabCount < numsfc2; iabCount++)
+							{
+								int iIndex10 = (int) sfc_ab[iabCount][Constants.sfc_ab_i];
+								int y = (int) sfc_ab[iabCount][Constants.sfc_ab_y];
+								int x = (int) sfc_ab[iabCount][Constants.sfc_ab_x];
+
+								// Restore httc, Rnet, Tconv from stored values for accumulations
+								httc = httc_patch[iabCount];
+								Rnet = Rnet_patch[iabCount];
+								Tconv = Tconv_patch[iabCount];
 
 								Trad[iabCount] = Math.pow(((1. / sigma)
 										* (sfc[iIndex10][Constants.sfc_emiss] * sigma * Math.pow(Tsfc[iabCount], 4) + refltl[iabCount])),
@@ -3996,6 +4365,12 @@ System.out.println("++++++++++++++++++++++++end outputUrbanPlumber=" + (System.c
 					//  this is the enddo for the latitude iteration
 				}
 				//  this is the enddo for the bh iteration
+
+				// Release pooled arrays back to the pool for reuse
+				arrayPool.releaseAllDouble(refl_emist, absbs, absbl, tots, totl,
+					refls, refll, reflts, refltl, reflps, reflpl,
+					Tsfc, Trad, lambda_sfc, Qh, Qe,
+					currentRnet, currentQe, currentQh, currentQg);
 			}
 			//  this is the enddo for the lp iteration
 		}
@@ -4015,6 +4390,9 @@ System.out.println("++++++++++++++++++++++++end outputUrbanPlumber=" + (System.c
 			System.out.println(
 					"...you may need to increase the resolution;the file Inputs_Store.out will tell you which simulations (if you performed more than one)suffered the most from a lack of resolution");
 		}
+
+		// Shutdown parallel processing and cleanup resources
+		shutdownParallelPool();
 	}
 
 }
